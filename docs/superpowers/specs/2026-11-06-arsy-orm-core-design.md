@@ -20,8 +20,9 @@
 - RLS **OFF** (kolom `tenant_id` + konstanta policy sudah digenerate tapi
   `ENABLE ROW LEVEL SECURITY` belum; dinyalakan SP2).
 - Auth JWT/API-key (middleware auth = stub yang mengembalikan `System` actor).
-- Relasi Many2one/O2o/M2M, computed fields, `_inherit`, ACL, router
-  generatif `/rest/*`, storage, console, CLI.
+- Relasi penuh (Many2one record/prefetch — SP1 hanya kolom FK polos, §3),
+  computed fields, `_inherit`, ACL, router generatif `/rest/*`, storage,
+  `ir.Attachment` (lahir di SP4 bersama storage), console, CLI.
 
 ## 2. Crate & dependensi baru
 
@@ -74,21 +75,50 @@ Aturan derive:
   `uuid→UUID`, `jsonb→JSONB`. `Option<T>` = NULL, `T` = NOT NULL.
 - properti field: `required`, `default = <literal|fn>`, `unique`,
   `index`, `selection = [..]` (validasi + CHECK di DB), `audit = false`.
+- `unique` SELALU dikompilasi menjadi `UNIQUE (tenant_id, col)` — tidak
+  pernah global, agar tenant lain boleh memakai login yang sama dan error
+  duplikat tidak membocorkan data tenant lain. `unique = global`
+  eksplisit hanya untuk tabel non-tenant (mis. `ir_module`).
 - `#[orm(audit = false)]` pada field → delta audit tidak menyimpan nilainya
   (untuk password_hash sejak awal).
+- Relasi v1 = **FK polos**: `#[orm(field(reference = "res.company"))]` →
+  kolom uuid + `REFERENCES res_company(id)`; search via nilai FK sudah
+  mungkin; lazy record/prefetch menyusul (SP6). Tanpa ini domain `base`
+  sendiri tidak bisa diekspresikan.
 
 Method bawaan per model (semua async, semua menerima `&Uow` + actor):
 
 ```rust
-ResUsers::create(uow, actor, values)   -> Id<ResUsers>
-ResUsers::browse(uow, actor, id)       -> Record<ResUsers>     // read-cache
-ResUsers::write(uow, actor, ids, values) -> ()
-ResUsers::unlink(uow, actor, ids)      -> ()
+ResUsers::create(uow, actor, values)      -> Id<ResUsers>
+ResUsers::browse(uow, actor, id)          -> Record<ResUsers>   // read-cache
+ResUsers::write(uow, actor, ids, values)  -> ()   // kunci baris FOR UPDATE (§4)
+ResUsers::unlink(uow, actor, ids)         -> ()   // HARD delete, jalur purge/GDPR
+ResUsers::toggle_active(uow, actor, ids)  -> ()   // archive/unarchive, bukan unlink
 ResUsers::search(uow, actor, domain, limit, offset) -> Vec<Id<ResUsers>>
 ResUsers::search_count(uow, actor, domain) -> i64
 ```
 
 `Record<T>` lazy-load field dari registry + prefetch cache read-only (§7).
+
+### 3.1 Model::validate — rumah aturan bisnis
+
+Sebelum persist (create & write) ORM memanggil hook pada record gabungan
+hasil, setelah pengecekan level field (required/selection/tipe):
+
+```rust
+impl ResUsers {
+    pub fn validate(&self, uow: &Uow, actor: &ActorContext,
+                    changed: &[FieldName]) -> Result<(), OrmError> { /* ... */ }
+}
+```
+
+- Rumah aturan lintas-field: normalisasi trim/lowercase, format email,
+  cek duplikat via `search` — analog `@api.constrains` Odoo.
+- Keputusan review: aturan lama `UserService` pindah ke sini 1:1 (§9).
+- Default implement disediakan derive macro (no-op) agar model tanpa
+  aturan tetap kompilasi; aturannya tidak boleh tersebar di handler.
+- Semantik archive: `toggle_active()` ≠ `unlink()`; search default
+  mengecualikan yang archived (`active_test`, §6).
 
 ## 4. ActorContext & Unit of Work
 
@@ -98,7 +128,7 @@ pub struct ActorContext {
     pub actor: Actor,          // System | User(Uuid) | (ApiKey/Service SP2+)
     pub roles: BTreeSet<String>,
 }
-pub struct Uow { tx: Mutex<sqlx::Transaction<'static, Postgres>> }
+pub struct Uow { conn: Mutex<sqlx::PgConnection> }  // BEGIN + SET LOCAL saat creation
 ```
 
 - `Uow::begin(pool, actor)` → `BEGIN; SET LOCAL app.tenant_id = $1` — statement
@@ -107,6 +137,13 @@ pub struct Uow { tx: Mutex<sqlx::Transaction<'static, Postgres>> }
 - Request handler membikin satu `Uow`; `arsy-server` saat ini merakitnya di
   layer route (pola yang sama dipakai router generatif SP3).
 - `uow.commit()` mengakhiri; drop tanpa commit = rollback.
+- **Konkurensi v1 = pessimistic** (keputusan): `write()`/`unlink()`
+  mengunci baris target dengan `SELECT ... FOR UPDATE` di dalam Uow sebelum
+  UPDATE/DELETE; deadlock → `OrmError::Db` → lapisan API memetakan ke 409
+  dengan pedoman retry ke client, tanpa retry senyap di ORM. Lost update
+  tidak bisa terjadi by default.
+- `Uow` di-scope satu task (Mutex menjaga akses koneksi dari helper, bukan
+  untuk sharing antar task); signature publik tetap `&Uow`.
 - Actor `System` = satu-satunya yang boleh `tenant = TenantId::PLATFORM`
   (untuk bootstrap `ir_module`, provisioning nanti).
 
@@ -144,9 +181,13 @@ let users = ResUsers::search(uow, &actor,
   `Domain::to_sql(&ModelMeta) -> (String /*$i placeholders*/, Vec<DbValue>)`.
 - Nama field divalidasi terhadap metadata saat **build query** (field tak
   dikenal = error, bukan SQL mentah); identifier tabel/kolom di-quote; nilai
-  selalu bind. Snapshot test wajib memuat kasus injection-ish values.
+  selalu bind; operator `in` di-expand per chunk ≤ 500 placeholder (tetap
+  bind). Snapshot test wajib memuat kasus injection-ish values.
+- **`active_test`** (konvensi Odoo): `search`/`search_count` pada model
+  ber-field `active` otomatis di-conjoin `("active", =, true)` kecuali uow
+  memilih `with_inactive`.
 - ORDER: v1 default `id DESC` (UUIDv7 ≈ kronologis); `order_by` eksplisit
-  menyusul.
+  menyusul. `ilike '%…'` butuh trigram index — dicatat untuk SP+.
 
 ## 7. Read cache (registry)
 
@@ -161,10 +202,12 @@ let users = ResUsers::search(uow, &actor,
 - Setiap crate add-on mendeklarasikan model via slice `linkme`
   `MODEL_REGISTRY: [ModelMeta]` yang diisi derive macro; `ModelMeta` memuat
   `addon`, `name`, `table`, `fields`, `owner_addon`.
-- Add-on itu sendiri terdaftar via `[package.metadata.arsy.addon]` +
-  link-time `ADDON_MANIFESTS`; `ModuleRegistry::from_crate()` membacanya saat
-  start, cek: semua `depends` ada dan ter-resolve topologis, jika tidak →
-  gagal start dengan pesan eksplisit.
+- Metadata `[package.metadata.arsy.addon]` di Cargo.toml **tidak terbaca di
+  runtime** — karena itu `build.rs` tiap add-on membaca Cargo.toml-nya saat
+  compile dan meng-embed manifest sebagai `#[used] static ADDON_MANIFEST`
+  (terkumpul di slice `ADDON_MANIFESTS`). `ModuleRegistry::assemble()`
+  membangun graf saat start: semua `depends` ada dan ter-topologis, jika
+  tidak → gagal start dengan pesan eksplisit.
 
 ### 8.2 Tabel kendali
 ```sql
@@ -183,11 +226,16 @@ CREATE TABLE ir_model_data (           -- external id, seperti Odoo
 ```
 
 ### 8.3 Pipeline install (satu Uow System per add-on)
-1. toposort depends → 2. jalankan `migrations/<ver>/*.sql` yang tertinggal →
-3. DDL sync: untuk tiap model milik add-on: `CREATE TABLE IF NOT EXISTS`;
-   kolom baru di-`ADD COLUMN` (nullable/defaults); kolom hilang **tidak**
-   pernah di-drop otomatis (v1: diwarnai di log); tipe berubah → error
-   eksplisit minta migrasi manual → 4. muat `data/*.toml` → 5. set
+1. toposort depends → 2. **`pg_advisory_xact_lock(hashtext(module))`** —
+   dua instance server yang start bersamaan tidak boleh install modul yang
+   sama → 3. **baseline**: bila baris `ir_module` baru (install pertama),
+   folder `migrations/<ver>/*.sql` DILEWATI dan `latest_version` diisi
+   setelah sync; bila upgrade, jalankan migrasi yang tertinggal → 4. DDL
+   sync: untuk tiap model milik add-on: `CREATE TABLE IF NOT EXISTS`;
+   kolom baru di-`ADD COLUMN` (nullable atau dengan default eksplisit —
+   NOT NULL tanpa default pada tabel terisi = error); kolom hilang **tidak**
+   pernah di-drop otomatis (v1: drift dilaporkan di log); tipe berubah →
+   error eksplisit minta migrasi manual → 5. muat `data/*.toml` → 6. set
    `ir_module.state='installed'`.
 
 ### 8.4 Format default data (toml, upsert external-id)
@@ -216,15 +264,27 @@ mereferensi dimuat setelah yang direferensi).
   Postgres nyata (testcontainers).
 - `deployments/docker-compose.yml`: tambah service `postgres:17-alpine` +
   healthcheck + volume; `DATABASE_URL` ke `.env.example`.
+- **Kriteria paritas validasi**: aturan lama UserService (trim name, format
+  email + lowercase, duplikat case-insensitive, envelope 400) harus lolos
+  1:1 di `tests/api.rs` baru — logikanya tinggal di `ResUsers::validate`,
+  `UNIQUE (tenant_id, login)` di DB sebagai backstop.
 
 ## 10. Error model
 
 ```rust
-pub enum OrmError { NotFound(String), Validation(String), Constraint(String),
-                    Domain(String), Module(String), Db(sqlx::Error) }
+pub enum OrmError {
+    NotFound(String),
+    Validation(String),  // field-level & Model::validate
+    Constraint { field: String, message: String }, // DB unique/CHECK/FK
+    Domain(String),
+    Module(String),
+    Db(sqlx::Error),     // termasuk deadlock/serialization
+}
 ```
-`Display` aman untuk client (tanpa SQL detail); `Db` hanya muncul sebagai
-`Internal` di lapisan API (pola `errors.rs` yang sudah ada).
+`Constraint` selalu menyebut field pelanggarnya (sumber pesan 400/409 yang
+berguna); `Display` aman untuk client (tanpa SQL detail); `Db` menjadi
+`Internal` di lapisan API (pola `errors.rs` yang sudah ada), kecuali
+deadlock yang dipetakan ke 409 dengan pedoman retry (keputusan §4).
 
 ## 11. Rencana testing (gate penerimaan)
 
@@ -232,13 +292,21 @@ pub enum OrmError { NotFound(String), Validation(String), Constraint(String),
 2. **Snapshot SQL**: DDL per model, WHERE hasil compile (kasus: nilai
    `"; DROP` , tipe value salah, field tak dikenal).
 3. **Integrasi (testcontainers Postgres)**: install `base` idempoten (2x
-   start = tidak duplikat); CRUD roundtrip incl. automatic columns terisi;
-   audit delta benar & scrub field; create duplicate `login` → Constraint;
-   upsert default data respect `noupdate`; xml_id reference resolve.
-4. **Aplikasi**: `tests/api.rs` versi ORM hijau terhadap Postgres container;
+   start = tidak duplikat); **dua install paralel = satu hasil bersih**
+   (advisory lock, tanpa deadlock/duplikat data); CRUD roundtrip incl.
+   automatic columns terisi; audit delta benar & scrub field; create
+   duplicate `login` → Constraint; **login sama antar beda tenant = OK**
+   (unique tenant-scoped); upsert default data respect `noupdate`; xml_id
+   reference resolve.
+4. **Perilaku (regression dari deep review)**: paritas `validate` (email
+   invalid → 400, duplikat → pesan menyebut field); `toggle_active` +
+   `active_test` (archived tidak muncul di search default); konkurensi:
+   dua `write()` paralel satu baris ter-serialisasi tanpa lost update.
+5. **Aplikasi**: `tests/api.rs` versi ORM hijau terhadap Postgres container;
    healthz tidak berubah.
-5. CI: job `postgres` service ditambahkan ke `ci.yml`; `just test` lokal
-   butuh docker berjalan (didokumentasikan di README).
+6. CI: job `postgres` service ditambahkan ke `ci.yml`; `just test` lokal
+   butuh docker berjalan + resep `just db` (`docker compose -f
+   deployments/docker-compose.yml up -d postgres`); README diperbarui.
 
 ## 12. Risiko & mitigasi
 
@@ -248,4 +316,41 @@ pub enum OrmError { NotFound(String), Validation(String), Constraint(String),
 | `SET LOCAL` bocor antar request | hanya dalam transaksi + test integrasi dua Uow paralel beda tenant (RLS off, cek `current_setting`) |
 | uuid vs bigint di Odoo-parity | diputus: UUIDv7; kolom `serial` internal TIDAK ada |
 | Drop-kolom tak sengaja saat refactor model | v1 menolak auto-drop; drift dilaporkan `arsy orm diff` (perintah CLI di SP3, v1: fungsi lib + test) |
+| Dua instance start bersamaan → double install | `pg_advisory_xact_lock` per module (§8.3) |
+| Unique global membocorkan / tabrakan antar tenant | `unique` dikompilasi `(tenant_id, col)` by default (§3) |
+| Lost update tanpa kontrol konkurensi | v1 pessimistic `FOR UPDATE` (§4); deadlock eksplisit 409 |
+| Aturan bisnis hilang saat migrasi dari UserService | paritas diuji di §11.4; rumah aturan = `Model::validate` (§3.1) |
 | Scope SP1 melebar | fitur apa pun yang bukan §1 Tujuan ditolak ke SP2+ |
+
+## Lampiran A — Bentuk `ModelMeta` (kontrak derive ↔ orm)
+
+```rust
+pub struct ModelMeta {
+    pub addon: &'static str,           // "base"
+    pub name: &'static str,            // "res.users"
+    pub table: &'static str,           // "res_users"
+    pub fields: &'static [FieldMeta],
+    pub audit: AuditMode,              // Off | Tracked
+    pub identity: IdentityStrategy,    // UuidV7 (tetap untuk SP1)
+}
+
+pub struct FieldMeta {
+    pub name: &'static str,
+    pub column: &'static str,
+    pub kind: FieldKind,   // Char|Text|Integer|Float|Boolean|Date|Timestamptz
+                           // |Uuid|Jsonb|M2o{target &str}
+    pub nullable: bool,
+    pub required: bool,
+    pub unique: UniqueScope,           // None | TenantScoped | Global
+    pub index: bool,
+    pub default: DefaultFn,            // None | Literal(Value) | Fn(fn() -> Value)
+    pub selection: Option<&'static [&'static str]>,
+    pub audit_scrub: bool,             // #[orm(audit = false)]
+}
+```
+
+- Slice `linkme`: `MODEL_REGISTRY: [(&ModelMeta, &ModelVtable)]`; `ModelVtable`
+  berisi fn ptr (`values_to_row`, `row_to_values`, `validate`).
+- `ModelMeta` adalah SATU sumber untuk DDL generator, domain compiler
+  (validasi kolom/tipe), dan generator OpenAPI nanti (SP3) — implementator
+  dilarang membuat representasi kedua.

@@ -42,8 +42,10 @@ crates/
   arsy-console?      (tidak ada — console bukan crate Rust)
   arsy-cli/          arsy serve / migrate / module install / tenant create
 addons/
-  base/              res.Company, res.User, res.Partner, ir.Module,
-                     ir.Attachment, audit_log, default data + ACL dasar
+  base/              res.Company, res.User (termasuk company_id FK),
+                     res.Partner, ir.Module, ir.Model.Data, audit_log,
+                     default data + ACL dasar (ir.Attachment baru lahir
+                     di SP4 bersama storage)
   (sale/, .../)      add-on turunan; _extend model base
 apps/
   arsy-server/       wiring: config → registry → router (tetap crate aplikasi)
@@ -71,14 +73,25 @@ saling bebas; model = unit registrasi, attachment = model ORM biasa.
 6. **Cache v1 = read-cache/prefetch saja; write langsung flush.** Cache-buffer
    Odoo-style ditunda sampai ada bukti kebutuhan.
 7. **`ir_module` global; konfigurasi feature/API-key/quota per tenant.**
+8. **Write path = pessimistic**: setiap `write`/`unlink` ORM mengunci baris
+   dengan `SELECT ... FOR UPDATE` dalam transaksi request; deadlock =
+   409 eksplisit ke client, tanpa auto-retry senyap di ORM v1.
+9. **Archive ≠ delete**: `toggle_active()` mengarsip (search default
+   mengecualikan archived, konvensi `active_test` Odoo); `unlink()` hard
+   delete dan menjadi bagian jalur purge tenant (GDPR).
+10. **`unique` default-nya tenant-scoped** — constraint DB `(tenant_id,
+    col)`; unique global hanya untuk tabel kontrol non-tenant.
 
 ## 5. RLS & tenancy
 
 - Setiap tabel model dibuat dengan policy
-  `USING (tenant_id = current_setting('app.tenant_id')::uuid)`.
-- Connection pool: routing tenant via `SET LOCAL` dalam transaksi (bukan
-  per-connection state), wajib ada guard agar statement di luar transaksi
-  tidak melihat nilai request sebelumnya.
+  `USING (tenant_id = current_setting('app.tenant_id', true)::uuid)` —
+  **fail-closed**: setting hilang/NULL = tolak, bukan error 55000.
+- **`FORCE ROW LEVEL SECURITY`** pada semua tabel model — tanpanya table
+  owner bypass policies (jebakan senyap klasik); role aplikasi bukan
+  superuser dan bukan owner tabel produksi.
+- Connection pool: routing tenant via `SET LOCAL` dalam transaksi —
+  kompatibel pgbouncer transaction-pooling; `SET` session-level dilarang.
 - `ir_tenant` registry: id, name, status (active/suspended/deleted), kuota
   (max rows, max storage bytes, rate).
 - Siklus hidup tenant: provision → suspend → **hard delete = purge**
@@ -90,9 +103,14 @@ saling bebas; model = unit registrasi, attachment = model ORM biasa.
 - Manifest di `[package.metadata.arsy.addon]`: `name`, `version`,
   `depends = ["base"]`, `data = ["data/company.toml", ...]`, `install_hooks`.
 - Registry mengumpulkan model saat binary start melalui registrasi link-time
-  (`linkme`/`inventory`); setiap model punya field `owner_addon`.
-- Install pipeline (per transisi `to install` → `installed`), dalam 1 transaksi:
-  topologis urut depends → DDL create/alter → muat data default → hooks.
+  (`linkme`); setiap model punya field `owner_addon`. Manifest Cargo.toml
+  di-embed `build.rs` tiap add-on sebagai static link-time (metadata Cargo
+  tidak tersedia di runtime).
+- Install pipeline (per transisi `to install` → `installed`), dalam 1
+  transaksi + `pg_advisory_xact_lock(module)` agar dua instance yang start
+  bareng tidak install ganda: topologis urut depends → cek baseline
+  (install pertama melewati `migrations/`) → DDL create/alter → muat data
+  default → hooks.
 - **External ID** `module.name` (kolom `xml_id` unik) → upsert idempotent;
   `noupdate = true` tidak ditimpa saat upgrade; add-on lain boleh
   me-reference `base.company_root`.
