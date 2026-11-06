@@ -1,0 +1,11 @@
+[package]
+name = "arsy-core"
+description = "Pure domain logic: models, errors, and service ports. No I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }

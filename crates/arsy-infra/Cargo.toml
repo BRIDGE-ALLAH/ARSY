@@ -1,0 +1,10 @@
+[package]
+name = "arsy-infra"
+description = "Infrastructure adapters: storage backends and external service clients."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+arsy-core = { workspace = true }
+uuid = { workspace = true }
